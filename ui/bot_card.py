@@ -257,7 +257,7 @@ class BotCard(ctk.CTkFrame):
         if running:
             self._status_label.configure(
                 text="Online",
-                fg_color=("#27ae6033", "#27ae6044"),
+                fg_color=("#d5f5e3", "#1a3a2a"),
                 text_color="#27ae60",
             )
             self._start_btn.configure(state="disabled")
@@ -308,11 +308,21 @@ class BotCard(ctk.CTkFrame):
         def worker():
             ok, msg = func()
             try:
-                self.after(0, lambda: self._poll_status())
+                self.after(0, self._force_status_refresh)
             except RuntimeError:
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _force_status_refresh(self, retries=3):
+        """Force update status and buttons, retrying briefly for lock file creation."""
+        running = self.controller.is_running(self.bot_info)
+        if not running and retries > 0:
+            # Bot may not have created its lock file yet — retry shortly
+            self.after(1500, lambda: self._force_status_refresh(retries - 1))
+            return
+        self._is_running = running
+        self._update_status_ui(running)
 
     def _open_log_file(self):
         """Open the log file in the OS default application."""

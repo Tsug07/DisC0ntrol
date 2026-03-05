@@ -110,12 +110,14 @@ def _find_main_script(bot_dir: Path, bot_key: str) -> Optional[str]:
 
 
 def _has_discord_import(filepath: Path) -> bool:
-    """Check if a Python file imports discord."""
+    """Check if a Python file imports discord (reads only first 100 lines)."""
     try:
-        content = filepath.read_text(encoding="utf-8", errors="ignore")
-        return bool(
-            re.search(r"^\s*(import\s+discord|from\s+discord)", content, re.MULTILINE)
-        )
+        with filepath.open(encoding="utf-8", errors="ignore") as f:
+            for _, line in zip(range(100), f):
+                stripped = line.lstrip()
+                if stripped.startswith(("import discord", "from discord")):
+                    return True
+        return False
     except OSError:
         return False
 
@@ -134,34 +136,63 @@ def _find_env_file(bot_dir: Path) -> Optional[str]:
 
 def _find_lock_file(bot_dir: Path, bot_key: str) -> Optional[str]:
     """Find or determine the lock file path for PID tracking."""
-    # Check for existing lock files
+    # Check for existing lock files in root
     expected = bot_dir / f"{bot_key}_bot.lock"
     if expected.exists():
         return str(expected)
 
-    # Check for any .lock file
+    # Check for any .lock file in root
     for lock in bot_dir.glob("*.lock"):
         return str(lock)
+
+    # Check common subdirectories (data/, config/)
+    for subdir in ("data", "config"):
+        sub = bot_dir / subdir
+        if sub.is_dir():
+            for lock in sub.glob("*.lock"):
+                return str(lock)
+
+    # Check for bot_<key>.lock in data/ even if it doesn't exist yet
+    data_dir = bot_dir / "data"
+    if data_dir.is_dir():
+        return str(data_dir / f"bot_{bot_key}.lock")
 
     # Return the expected path even if it doesn't exist yet
     return str(expected)
 
 
 def _find_log_file(bot_dir: Path) -> Optional[str]:
-    """Find the log file for the bot."""
+    """Find the most recent log file for the bot."""
     # Check logs/ subdirectory
     logs_dir = bot_dir / "logs"
     if logs_dir.is_dir():
-        for log_file in sorted(logs_dir.glob("*.log"), key=os.path.getmtime, reverse=True):
-            return str(log_file)
+        best = _newest_log(logs_dir)
+        if best:
+            return str(best)
 
     # Check root directory
-    for log_file in sorted(bot_dir.glob("*.log"), key=os.path.getmtime, reverse=True):
-        return str(log_file)
+    best = _newest_log(bot_dir)
+    if best:
+        return str(best)
 
     # Return expected path
     logs_dir.mkdir(exist_ok=True)
     return str(logs_dir / "bot_logs.log")
+
+
+def _newest_log(directory: Path) -> Optional[Path]:
+    """Return the most recently modified .log file without sorting all files."""
+    newest = None
+    newest_mtime = -1.0
+    for log_file in directory.glob("*.log"):
+        try:
+            mtime = log_file.stat().st_mtime
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest = log_file
+        except OSError:
+            continue
+    return newest
 
 
 class BotScanner:
@@ -197,11 +228,15 @@ class BotScanner:
 
     def scan_all(self) -> list[dict]:
         """Scan all registered directories and return discovered bots."""
+        import time as _time
+        t0 = _time.perf_counter()
         discovered = []
         seen_dirs = set()
 
         # Include manually registered bots
-        for bot in self.config.get("registered_bots", []):
+        registered = self.config.get("registered_bots", [])
+        logger.info("Scanning %d registered bot(s)...", len(registered))
+        for bot in registered:
             bot_dir = Path(bot.get("directory", ""))
             if bot_dir.is_dir() and str(bot_dir) not in seen_dirs:
                 seen_dirs.add(str(bot_dir))
@@ -210,13 +245,18 @@ class BotScanner:
                     # Preserve manual overrides
                     info["color"] = bot.get("color", info["color"])
                     discovered.append(info)
+                    logger.info("  [registered] Found: %s", info["name"])
 
         # Scan registered directories
-        for directory in self.config.get("bot_directories", []):
+        directories = self.config.get("bot_directories", [])
+        logger.info("Scanning %d director(y/ies)...", len(directories))
+        for directory in directories:
             dir_path = Path(directory)
             if not dir_path.is_dir():
-                logger.warning("Directory not found: %s", directory)
+                logger.warning("  Directory not found: %s", directory)
                 continue
+
+            logger.info("  Scanning: %s", directory)
 
             # First, scan subdirectories for bots
             found_in_subdirs = False
@@ -225,13 +265,18 @@ class BotScanner:
                     continue
                 # Skip common non-bot directories
                 if entry.name.startswith(".") or entry.name in _SKIP_DIRS:
+                    logger.debug("  Skipping: %s", entry.name)
                     continue
                 if str(entry) not in seen_dirs:
+                    logger.info("    Checking: %s", entry.name)
                     info = discover_bot_info(entry)
                     if info:
                         seen_dirs.add(str(entry))
                         discovered.append(info)
                         found_in_subdirs = True
+                        logger.info("    -> Found bot: %s (script: %s)", info["name"], info["script"])
+                    else:
+                        logger.info("    -> Not a bot (no discord import)")
 
             # If no bots found in subdirs, check if the directory itself is a bot
             if not found_in_subdirs and str(dir_path) not in seen_dirs:
@@ -240,7 +285,8 @@ class BotScanner:
                     seen_dirs.add(str(dir_path))
                     discovered.append(info)
 
-        logger.info("Discovered %d bot(s)", len(discovered))
+        elapsed = (_time.perf_counter() - t0) * 1000
+        logger.info("Scan complete: %d bot(s) found in %.0fms", len(discovered), elapsed)
         return discovered
 
     def add_directory(self, directory: str) -> int:

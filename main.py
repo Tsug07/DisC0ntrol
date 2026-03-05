@@ -31,20 +31,57 @@ logging.basicConfig(
 logger = logging.getLogger("DisC0ntrol")
 
 
+LOCK_FILE = PROJECT_ROOT / "discontrol.lock"
+
+
+def _acquire_single_instance():
+    """Ensure only one instance of DisC0ntrol is running."""
+    import psutil
+
+    if LOCK_FILE.is_file():
+        try:
+            old_pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
+            proc = psutil.Process(old_pid)
+            if "python" in proc.name().lower():
+                # Already running — bring focus hint via file and exit
+                logger.warning("DisC0ntrol já está rodando (PID %d). Encerrando.", old_pid)
+                print(f"DisC0ntrol já está em execução (PID {old_pid}).")
+                sys.exit(0)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+            pass  # Stale lock file — safe to proceed
+
+    # Write current PID
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+    import atexit
+    atexit.register(lambda: LOCK_FILE.unlink(missing_ok=True))
+
+
 def main():
+    _acquire_single_instance()
     logger.info("Starting DisC0ntrol...")
 
     from ui.dashboard import Dashboard
+    from ui.splash_screen import SplashScreen
 
     app = Dashboard(config_path=str(CONFIG_PATH))
 
-    # Setup system tray after window is shown
-    app.after(1000, app.setup_tray)
+    # Hide dashboard while splash is visible
+    app.withdraw()
 
-    # Handle start minimized
-    settings = app.scanner.config.get("settings", {})
-    if settings.get("start_minimized", False):
-        app.after(1500, app.minimize_to_tray)
+    splash = SplashScreen(app)
+
+    def _on_splash_done():
+        """Show the main window after splash closes."""
+        app.deiconify()
+        app.after(500, app.setup_tray)
+
+        settings = app.scanner.config.get("settings", {})
+        if settings.get("start_minimized", False):
+            app.after(1000, app.minimize_to_tray)
+
+    # When splash is destroyed, show the dashboard
+    splash.bind("<Destroy>", lambda e: _on_splash_done() if e.widget is splash else None)
 
     app.mainloop()
 

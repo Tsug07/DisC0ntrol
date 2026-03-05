@@ -11,6 +11,7 @@ import signal
 import subprocess
 import logging
 import time
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -29,13 +30,18 @@ class BotController:
     # Status helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def is_running(bot_info: dict) -> bool:
+    def is_running(self, bot_info: dict) -> bool:
         """Check if a bot is currently running by verifying its PID."""
-        pid = BotController.read_pid(bot_info)
-        if pid is None:
-            return False
-        return BotController._pid_alive(pid)
+        pid = self.read_pid(bot_info)
+        if pid is not None and self._pid_alive(pid):
+            return True
+
+        # Fallback: check tracked subprocess (for bots without lock files)
+        proc = self._processes.get(bot_info.get("directory"))
+        if proc is not None and proc.poll() is None:
+            return True
+
+        return False
 
     @staticmethod
     def read_pid(bot_info: dict) -> Optional[int]:
@@ -77,7 +83,7 @@ class BotController:
                 return {
                     "pid": pid,
                     "status": proc.status(),
-                    "cpu_percent": proc.cpu_percent(interval=0.1),
+                    "cpu_percent": proc.cpu_percent(interval=None),
                     "memory_mb": round(proc.memory_info().rss / (1024 * 1024), 1),
                     "create_time": proc.create_time(),
                     "uptime_seconds": time.time() - proc.create_time(),
@@ -113,22 +119,42 @@ class BotController:
             # Use the same Python interpreter that runs DisC0ntrol
             python_exe = sys.executable
 
+            # Redirect stderr to a crash log for debugging
+            logs_dir = Path(bot_dir) / "logs"
+            logs_dir.mkdir(exist_ok=True)
+            stderr_path = logs_dir / "stderr.log"
+            stderr_file = open(stderr_path, "a", encoding="utf-8")
+
+            # Remove stale lock file before starting so the bot
+            # doesn't think it's already running
+            lock_path = bot_info.get("lock_file")
+            if lock_path and Path(lock_path).is_file():
+                try:
+                    Path(lock_path).unlink()
+                except OSError:
+                    pass
+
             proc = subprocess.Popen(
                 [python_exe, script],
                 cwd=bot_dir,
                 env=env,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_file,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
 
-            # Write PID to lock file
-            lock_path = bot_info.get("lock_file")
-            if lock_path:
-                Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(lock_path).write_text(str(proc.pid), encoding="utf-8")
-
+            # Let the bot create its own lock file.
+            # Store the PID in memory for tracking.
             self._processes[bot_info["directory"]] = proc
+
+            # Schedule fallback lock file creation after 10s
+            # (gives bot time to create its own lock file first)
+            def _deferred_lock(bi=bot_info, p=proc):
+                time.sleep(10)
+                if p.poll() is None:  # Still running
+                    self._ensure_lock_file(bi, p.pid)
+
+            threading.Thread(target=_deferred_lock, daemon=True).start()
 
             logger.info("Started %s (PID %d)", bot_info["name"], proc.pid)
             return True, f"{bot_info['name']} iniciado (PID {proc.pid})."
@@ -143,9 +169,16 @@ class BotController:
         Returns (success, message).
         """
         pid = self.read_pid(bot_info)
-        if pid is None or not self._pid_alive(pid):
-            self._cleanup_lock(bot_info)
-            return False, f"{bot_info['name']} não está rodando."
+
+        # Fallback: get PID from tracked subprocess
+        if (pid is None or not self._pid_alive(pid)):
+            proc = self._processes.get(bot_info.get("directory"))
+            if proc is not None and proc.poll() is None:
+                pid = proc.pid
+            else:
+                self._cleanup_lock(bot_info)
+                self._processes.pop(bot_info.get("directory"), None)
+                return False, f"{bot_info['name']} não está rodando."
 
         try:
             proc = psutil.Process(pid)
@@ -190,6 +223,21 @@ class BotController:
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_lock_file(bot_info: dict, pid: int):
+        """Create a lock file if the bot didn't create one itself."""
+        lock_path = bot_info.get("lock_file")
+        if not lock_path:
+            return
+        lock = Path(lock_path)
+        if not lock.is_file():
+            try:
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                lock.write_text(str(pid), encoding="utf-8")
+                logger.info("Created fallback lock file for %s (PID %d)", bot_info.get("name"), pid)
+            except OSError:
+                pass
 
     @staticmethod
     def _cleanup_lock(bot_info: dict):
